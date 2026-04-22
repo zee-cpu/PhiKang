@@ -1,13 +1,17 @@
-#ifndef KANGAOOTH
-#define KANGAOOTH
+#ifndef KANGAROOH
+#define KANGAROOH
 
 // ============================================================================
-// PhiKang — Kangaroo Solver Class
+// PhiKang — Kangaroo Solver Class Declaration
 //
-// Changes vs original:
-//   - GLV jump table precomputation (jPhiPx, jD1, jD2)
-//   - Workfile v3.0 with human-readable stats header
-//   - ITEM uses full 256-bit distance (bug fix flows from GPUEngine.h)
+// Changes vs original JeanLucPons/Kangaroo:
+//   - GLV jump table arrays (jPhiPxArr, jD1Arr, jD2Arr) + CreateGLVJumpTable()
+//   - glvReady flag guards GLV arrays before use in Run()
+//   - WorkfileHeader v3.0: packed struct, glvEnabled/symmetryEnabled fields,
+//     clarified field types
+//   - ITEM uses full 256-bit distance (4 limbs) — bug fix
+//   - FetchKangaroos typo fixed (was FectchKangaroos)
+//   - counters[] size documented
 //   - Server/client architecture preserved
 //   - USE_SYMMETRY preserved
 // ============================================================================
@@ -16,368 +20,421 @@
 #include <vector>
 
 #ifdef WIN64
-#include <windows.h>
+  #include <windows.h>
 #else
-#include <pthread.h>
-#include <semaphore.h>
-#include <signal.h>
+  #include <pthread.h>
+  #include <semaphore.h>
+  #include <signal.h>
 #endif
 
-#include “SECPK1/SECP256k1.h”
-#include “GPU/GPUEngine.h”
-#include “HashTable.h”
-#include “Timer.h”
-#include “Constants.h”
+#include "SECPK1/SECP256k1.h"
+#include "GPU/GPUEngine.h"
+#include "HashTable.h"
+#include "Timer.h"
+#include "Constants.h"
 
 // ––––––––––––––––––––––––––––––––––––––
 // Platform threading abstractions
 // ––––––––––––––––––––––––––––––––––––––
-
 #ifdef WIN64
-typedef HANDLE           THREAD_HANDLE;
-typedef CRITICAL_SECTION MUTEX_TYPE;
-#define LOCK(m)          EnterCriticalSection(&m)
-#define UNLOCK(m)        LeaveCriticalSection(&m)
-#define CREATEM(m)       InitializeCriticalSection(&m)
-#define DESTROYM(m)      DeleteCriticalSection(&m)
+  typedef HANDLE          THREAD_HANDLE;
+  typedef CRITICAL_SECTION MUTEX_TYPE;
+  #define LOCK(m)          EnterCriticalSection(&m)
+  #define UNLOCK(m)        LeaveCriticalSection(&m)
+  #define CREATEM(m)       InitializeCriticalSection(&m)
+  #define DESTROYM(m)      DeleteCriticalSection(&m)
 #else
-typedef pthread_t        THREAD_HANDLE;
-typedef pthread_mutex_t  MUTEX_TYPE;
-#define LOCK(m)          pthread_mutex_lock(&m)
-#define UNLOCK(m)        pthread_mutex_unlock(&m)
-#define CREATEM(m)       pthread_mutex_init(&m, NULL)
-#define DESTROYM(m)      pthread_mutex_destroy(&m)
+  typedef pthread_t        THREAD_HANDLE;
+  typedef pthread_mutex_t  MUTEX_TYPE;
+  #define LOCK(m)          pthread_mutex_lock(&m)
+  #define UNLOCK(m)        pthread_mutex_unlock(&m)
+  #define CREATEM(m)       pthread_mutex_init(&m, NULL)
+  #define DESTROYM(m)      pthread_mutex_destroy(&m)
 #endif
 
 // ––––––––––––––––––––––––––––––––––––––
 // Thread parameter block
-// Passed to each CPU and GPU solver thread
+// One instance is heap-allocated per solver thread (CPU or GPU).
+// The obj back-pointer lets thread functions call Kangaroo methods.
 // ––––––––––––––––––––––––––––––––––––––
-
 typedef struct {
-// Thread identity
-int       threadId;
-int       gpuId;
-int       gridSizeX;
-int       gridSizeY;
 
-```
-// Kangaroo state (heap allocated per thread)
-Int      *px;
-Int      *py;
-Int      *distance;
-uint64_t  nbKangaroo;
+  // Thread identity
+  int threadId;
+  int gpuId;
+  int gridSizeX;
+  int gridSizeY;
 
-// Thread lifecycle
-bool      isRunning;
-bool      hasStarted;
-bool      isWaiting;
-```
+  // Kangaroo state arrays (heap-allocated, nbKangaroo elements each)
+  Int      *px;           // X coordinates
+  Int      *py;           // Y coordinates
+  Int      *distance;     // 256-bit accumulated distances
+  uint64_t  nbKangaroo;   // number of kangaroos owned by this thread
+
+  // Thread lifecycle flags (written by thread, read by host)
+  bool isRunning;
+  bool hasStarted;
+  bool isWaiting;   // true while thread blocks waiting for server data
 
 #ifdef USE_SYMMETRY
-uint64_t *symClass;
+  uint64_t *symClass;     // equivalence class tag per kangaroo
 #endif
 
-```
-// Back-pointer to owning Kangaroo instance
-class Kangaroo *obj;
-```
+  // Back-pointer to the owning Kangaroo instance
+  class Kangaroo *obj;
 
 } TH_PARAM;
 
 // ––––––––––––––––––––––––––––––––––––––
-// Workfile v3.0 header (human-readable + binary)
-// Written at the start of every .phk workfile
+// WorkfileHeader — binary header for .phk workfiles (v3.0)
+//
+// Written at offset 0 of every workfile, followed immediately by the
+// human-readable stats block (null-terminated ASCII), then the binary
+// kangaroo state array.
+//
+// IMPORTANT: #pragma pack(1) is required.  Without it the compiler may
+// insert padding between mixed uint32_t / uint64_t fields, making the
+// binary layout differ across compilers and platforms — breaking
+// workfile portability.
+//
+// Workfile v3.0 is NOT backwards-compatible with v2.x / v1.x files
+// because each kangaroo now stores four distance limbs (d0–d3) instead
+// of two, and GLV runs add d1_glv / d2_glv components.
 // ––––––––––––––––––––––––––––––––––––––
-
+#pragma pack(push, 1)
 typedef struct {
-uint64_t magic;           // WORKFILE_MAGIC = “PHIKANG\0”
-uint32_t version;         // WORKFILE_VERSION = 3
-uint32_t dpSize;          // Distinguished point bit count
-uint64_t rangeStart[4];   // Range start (256-bit)
-uint64_t rangeEnd[4];     // Range end (256-bit)
-uint64_t expectedOps;     // Expected operations (as double bits)
-uint64_t stepsCompleted;  // Steps completed so far
-uint64_t collisions;      // Total collisions
-uint64_t sameHerd;        // Same-herd collisions
-uint32_t nbKangaroo;      // Total kangaroo count
-uint32_t glvEnabled;      // 1 if GLV was active during this run
-uint32_t symmetryEnabled; // 1 if USE_SYMMETRY was active
-uint32_t nbKeys;          // Number of target keys
-// Followed by binary kangaroo state
+
+  uint64_t magic;              // Must equal WORKFILE_MAGIC ("PHIKANG\0")
+  uint32_t version;            // Must equal WORKFILE_VERSION (3)
+  uint32_t dpSize;             // Distinguished point bit count used during run
+
+  uint64_t rangeStart[4];      // Search range start (256-bit, 4 limbs LE)
+  uint64_t rangeEnd[4];        // Search range end   (256-bit, 4 limbs LE)
+
+  // Progress tracking
+  // expectedOps is stored as a IEEE 754 double reinterpreted as uint64_t
+  // (use memcpy to convert — avoids strict-aliasing UB).
+  // Represents the expected number of group operations, e.g. 2^34.2.
+  uint64_t expectedOpsRaw;     // reinterpret_cast<uint64_t>(double expectedOps)
+  uint64_t stepsCompleted;     // actual group operations completed so far
+  uint64_t collisions;         // total distinguished-point collisions found
+  uint64_t collisionsSameHerd; // collisions discarded (same herd — useless)
+
+  // Configuration snapshot (must match on resume, or DP overhead applies)
+  uint32_t nbKangaroo;         // total kangaroo count (tame + wild)
+  uint32_t glvEnabled;         // 1 if GLV was active during this run
+  uint32_t symmetryEnabled;    // 1 if USE_SYMMETRY was active
+  uint32_t nbKeys;             // number of target public keys
+
+  // NOTE: No padding needed — fields above sum to exactly 128 bytes.
+  // If you add fields here, add a corresponding _reserved[] shrink
+  // and keep the static_assert below passing.
+
 } WorkfileHeader;
+#pragma pack(pop)
+
+// Verify header is exactly 128 bytes so the binary state that follows
+// starts on a cache-line boundary.  If this fires, adjust _reserved[].
+#ifdef __cplusplus
+  static_assert(sizeof(WorkfileHeader) == 128,
+    "WorkfileHeader must be exactly 128 bytes — adjust _reserved[] padding");
+#endif
 
 // ––––––––––––––––––––––––––––––––––––––
 // Kangaroo — main solver class
 // ––––––––––––––––––––––––––––––––––––––
-
 class Kangaroo {
 
 public:
 
-```
-// -----------------------------------------------------------------------
-// Construction
-// -----------------------------------------------------------------------
-
-Kangaroo(
-    Secp256K1  *secp,
-    int32_t     initDPSize,
-    bool        useGpu,
+  // -----------------------------------------------------------------------
+  // Construction / destruction
+  // -----------------------------------------------------------------------
+  Kangaroo(
+    Secp256K1   *secp,
+    int32_t      initDPSize,
+    bool         useGpu,
     std::string &workFile,
     std::string &iWorkFile,
-    uint32_t    savePeriod,
-    bool        saveKangaroo,
-    bool        saveKangarooByServer,
-    double      maxStep,
-    int         wtimeout,
-    int         port,
-    int         ntimeout,
-    std::string serverIp,
-    std::string outputFile,
-    bool        splitWorkfile
-);
+    uint32_t     savePeriod,
+    bool         saveKangaroo,
+    bool         saveKangarooByServer,
+    double       maxStep,
+    int          wtimeout,
+    int          port,
+    int          ntimeout,
+    std::string  serverIp,
+    std::string  outputFile,
+    bool         splitWorkfile
+  );
 
-~Kangaroo();
+  ~Kangaroo();
 
-// -----------------------------------------------------------------------
-// Configuration
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Configuration
+  // -----------------------------------------------------------------------
+  bool ParseConfigFile(std::string &fileName);
+  void InitRange();
+  void InitSearchKey();
+  void SetDP(int size);
+  bool IsDP(Int *x);
 
-bool ParseConfigFile(std::string &fileName);
-void InitRange();
-void InitSearchKey();
-void SetDP(int size);
-bool IsDP(Int *x);
+  // -----------------------------------------------------------------------
+  // Jump table — standard + GLV
+  // -----------------------------------------------------------------------
 
-// -----------------------------------------------------------------------
-// Jump table — standard + GLV
-// -----------------------------------------------------------------------
+  // Build the standard jump table: NB_JUMP random points and distances.
+  // Always called first.  Also calls CreateGLVJumpTable() internally
+  // to keep the two tables in sync — do not call CreateGLVJumpTable()
+  // separately unless you know what you're doing.
+  void CreateJumpTable();
 
-void CreateJumpTable();
+  // Precompute the GLV extension of the jump table:
+  //   jPhiPxArr[i] = beta * jumpPointx[i] mod p   (phi endomorphism)
+  //   jD1Arr[i], jD2Arr[i] = GLV decomposition of jumpDistance[i]
+  //
+  // Sets glvReady = true on success.
+  // Called automatically from CreateJumpTable(); safe to call directly
+  // if the base jump table has been loaded from a workfile.
+  void CreateGLVJumpTable();
 
-// Precompute GLV jump table components:
-//   jPhiPxArr[i] = beta * jumpPointx[i] mod p   (phi endomorphism)
-//   jD1Arr[i], jD2Arr[i] = GLV decomposition of jumpDistance[i]
-// Called after CreateJumpTable(), before Run()
-void CreateGLVJumpTable();
-
-// -----------------------------------------------------------------------
-// Herd management
-// -----------------------------------------------------------------------
-
-void CreateHerd(
+  // -----------------------------------------------------------------------
+  // Herd management
+  // -----------------------------------------------------------------------
+  void CreateHerd(
     int   nbKangaroo,
     Int  *px,
     Int  *py,
     Int  *d,
     int   firstType,
     bool  lock = true
-);
+  );
 
-// -----------------------------------------------------------------------
-// Solver entry points
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Solver entry points
+  // -----------------------------------------------------------------------
 
-void Run(
-    int nbThread,
-    std::vector<int> gpuId,
-    std::vector<int> gridSize
-);
+  // Top-level solver.  Launches CPU + GPU threads, monitors progress,
+  // handles save/resume, terminates when key found or maxStep reached.
+  // Precondition: CreateJumpTable() (and therefore CreateGLVJumpTable())
+  // must have been called, and glvReady must be true.
+  void Run(
+    int               nbThread,
+    std::vector<int>  gpuId,
+    std::vector<int>  gridSize
+  );
 
-void SolveKeyCPU(TH_PARAM *ph);
-void SolveKeyGPU(TH_PARAM *ph);
+  // Thread worker functions — do not call directly; use Run().
+  void SolveKeyCPU(TH_PARAM *ph);
+  void SolveKeyGPU(TH_PARAM *ph);
 
-// -----------------------------------------------------------------------
-// Workfile operations (v3.0)
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Workfile operations (v3.0)
+  // -----------------------------------------------------------------------
+  bool LoadWork(std::string &fileName);
+  bool SaveWork(std::string &fileName);
+  bool MergeWork(std::string &file1, std::string &file2, std::string &dest);
+  bool MergeDir(std::string &dir, std::string &dest);
+  void WorkInfo(std::string &fileName);       // prints human-readable stats
+  bool CheckWorkFile(int nbThread, std::string &fileName);
+  static void CreateEmptyPartWork(std::string &fileName);
 
-bool LoadWork(std::string &fileName);
-bool SaveWork(std::string &fileName);
-bool MergeWork(std::string &file1, std::string &file2,
-               std::string &dest);
-bool MergeDir(std::string &dir, std::string &dest);
-void WorkInfo(std::string &fileName);    // Human-readable stats dump
-bool CheckWorkFile(int nbThread, std::string &fileName);
+  // -----------------------------------------------------------------------
+  // Server / client (preserved from original)
+  // -----------------------------------------------------------------------
+  void RunServer();
+  void RunClient();
+  bool GetConfigFromServer();
+  void SendToServer(std::vector<ITEM> &dps, int threadId, int gpuId);
 
-static void CreateEmptyPartWork(std::string &fileName);
+  // -----------------------------------------------------------------------
+  // Utility / debug
+  // -----------------------------------------------------------------------
+  void Check(std::vector<int> gpuId, std::vector<int> gridSize);
+  void ComputeExpected(double dp, double *op, double *ram, double *overHead);
+  std::string GetTimeStr(double t);
 
-// -----------------------------------------------------------------------
-// Server / client (preserved from original)
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Public data — search parameters (set by ParseConfigFile + InitRange)
+  // -----------------------------------------------------------------------
+  Int rangeStart;
+  Int rangeEnd;
+  Int rangeWidth;
+  Int rangeWidthDiv2;
+  Int rangeWidthDiv4;
+  Int rangeWidthDiv8;
+  int rangePower;               // floor(log2(rangeWidth))
 
-void RunServer();
-void RunClient();
-bool GetConfigFromServer();
-void SendToServer(std::vector<ITEM> &dps, int threadId, int gpuId);
+  std::vector<Point> keysToSearch;
+  Point keyToSearch;
+  Point keyToSearchNeg;         // negation of keyToSearch (for USE_SYMMETRY)
+  int   keyIdx;                 // index of key currently being solved
 
-// -----------------------------------------------------------------------
-// Utility / debug
-// -----------------------------------------------------------------------
-
-void Check(std::vector<int> gpuId, std::vector<int> gridSize);
-void ComputeExpected(double dp, double *op, double *ram,
-                     double *overHead);
-
-std::string GetTimeStr(double t);
-
-// -----------------------------------------------------------------------
-// Public data — search parameters
-// -----------------------------------------------------------------------
-
-Int    rangeStart;
-Int    rangeEnd;
-Int    rangeWidth;
-Int    rangeWidthDiv2;
-Int    rangeWidthDiv4;
-Int    rangeWidthDiv8;
-int    rangePower;
-
-std::vector<Point> keysToSearch;
-Point  keyToSearch;
-Point  keyToSearchNeg;
-int    keyIdx;
-
-double expectedNbOp;
-double expectedMem;
-```
+  double expectedNbOp;          // expected group operations (floating point)
+  double expectedMem;           // expected RAM usage in MB
 
 private:
 
-```
-// -----------------------------------------------------------------------
-// Collision resolution
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Collision resolution
+  // -----------------------------------------------------------------------
+  bool Output(Int *pk, char sInfo, int sType);
+  bool CheckKey(Int d1, Int d2, uint8_t type);
+  bool CollisionCheck(Int *d1, uint32_t type1, Int *d2, uint32_t type2);
+  bool AddToTable(Int *pos, Int *dist, uint32_t kType);
+  bool AddToTable(int256_t *x, int256_t *d, uint32_t kType);
 
-bool Output(Int *pk, char sInfo, int sType);
-bool CheckKey(Int d1, Int d2, uint8_t type);
-bool CollisionCheck(Int *d1, uint32_t type1, Int *d2, uint32_t type2);
-bool AddToTable(Int *pos, Int *dist, uint32_t kType);
-bool AddToTable(int256_t *x, int256_t *d, uint32_t kType);
+  // -----------------------------------------------------------------------
+  // Network helpers
+  // -----------------------------------------------------------------------
+  bool ConnectToServer(int *sock);
+  void DisconnectFromServer(int sock);
 
-// -----------------------------------------------------------------------
-// Network helpers
-// -----------------------------------------------------------------------
-
-bool ConnectToServer(int *sock);
-void DisconnectFromServer(int sock);
-
-// -----------------------------------------------------------------------
-// Thread helpers
-// -----------------------------------------------------------------------
-
-THREAD_HANDLE LaunchThread(
-```
-
+  // -----------------------------------------------------------------------
+  // Thread helpers
+  // -----------------------------------------------------------------------
+  THREAD_HANDLE LaunchThread(
 #ifdef WIN64
-LPTHREAD_START_ROUTINE func,
+    LPTHREAD_START_ROUTINE func,
 #else
-void *(*func)(void *),
+    void *(*func)(void *),
 #endif
-void *arg
-);
-void JoinThreads(THREAD_HANDLE *handles, int count);
-void FreeHandles(THREAD_HANDLE *handles, int count);
-void Process(TH_PARAM *params, const char *unit);
-void FectchKangaroos(TH_PARAM *params);
+    void *arg
+  );
 
-```
-uint64_t getCPUCount();
-uint64_t getGPUCount();
+  void JoinThreads(THREAD_HANDLE *handles, int count);
+  void FreeHandles(THREAD_HANDLE *handles, int count);
+  void Process(TH_PARAM *params, const char *unit);
 
-// -----------------------------------------------------------------------
-// Jump table storage
-// Standard (original)
-Int jumpDistance[NB_JUMP];
-Int jumpPointx[NB_JUMP];
-Int jumpPointy[NB_JUMP];
+  // Copies kangaroo state from GPU back to host TH_PARAM arrays.
+  // NOTE: was mis-spelled "FectchKangaroos" in earlier drafts — fixed.
+  void FetchKangaroos(TH_PARAM *params);
 
-// GLV extended
-Int jPhiPxArr[NB_JUMP];    // phi(J[i]).x = beta * J[i].x mod p
-Int jD1Arr[NB_JUMP];       // GLV k1 component of jumpDistance[i]
-Int jD2Arr[NB_JUMP];       // GLV k2 component of jumpDistance[i]
+  uint64_t getCPUCount();
+  uint64_t getGPUCount();
 
-// -----------------------------------------------------------------------
-// Runtime state
-// -----------------------------------------------------------------------
+  // -----------------------------------------------------------------------
+  // Jump table storage
+  //
+  // Standard table (computed by CreateJumpTable):
+  //   jumpDistance[i]  — scalar distance added at jump i
+  //   jumpPointx[i]    — X coordinate of jump point J[i]
+  //   jumpPointy[i]    — Y coordinate of jump point J[i]
+  //
+  // GLV extension (computed by CreateGLVJumpTable, requires glvReady):
+  //   jPhiPxArr[i]     — beta * J[i].x mod p  (phi endomorphism X)
+  //   jD1Arr[i]        — GLV k1 component of jumpDistance[i]
+  //   jD2Arr[i]        — GLV k2 component of jumpDistance[i]
+  //
+  // All arrays are NB_JUMP elements long (see Constants.h).
+  // -----------------------------------------------------------------------
+  Int jumpDistance[NB_JUMP];
+  Int jumpPointx[NB_JUMP];
+  Int jumpPointy[NB_JUMP];
 
-Secp256K1  *secp;
-HashTable   hashTable;
+  Int jPhiPxArr[NB_JUMP];   // precomputed phi(J[i]).x = beta * J[i].x mod p
+  Int jD1Arr[NB_JUMP];      // GLV k1 component: jumpDistance[i] = k1 + k2*λ
+  Int jD2Arr[NB_JUMP];      // GLV k2 component
 
-int         nbCPUThread;
-int         nbGPUThread;
-uint64_t    totalRW;           // total kangaroos (tame + wild)
-uint64_t    collisionInSameHerd;
+  // Set to true by CreateGLVJumpTable(); checked by Run() before GPU launch.
+  // Prevents accidental use of uninitialised GLV arrays.
+  bool glvReady;
 
-// Counters (one per thread)
-uint64_t    counters[256];
+  // -----------------------------------------------------------------------
+  // Runtime state
+  // -----------------------------------------------------------------------
+  Secp256K1  *secp;
+  HashTable   hashTable;
 
-// Work file state
-std::string workFile;
-std::string inputFile;
-std::string outputFile;
-uint32_t    saveWorkPeriod;    // seconds between auto-saves
-bool        saveKangaroo;
-bool        saveKangarooByServer;
-bool        splitWorkfile;
-uint64_t    nbLoadedWalk;
-FILE       *fRead;
+  int      nbCPUThread;
+  int      nbGPUThread;
+  uint64_t totalRW;               // total kangaroo count (tame + wild)
+  uint64_t collisionInSameHerd;   // same-herd collisions (diagnostic only)
 
-// Search control
-bool        endOfSearch;
-bool        saveRequest;
-int32_t     initDPSize;
-int         dpSize;
-int256_t    dMask;
-double      maxStep;
-double      offsetTime;
-uint64_t    offsetCount;
+  // Per-thread step counters.
+  // Sized to 256 to cover any realistic CPU thread count + GPU thread
+  // count combination without dynamic allocation.  Index [i] is owned
+  // exclusively by thread i — no locking needed for individual reads.
+  uint64_t counters[256];
 
-// GPU
-bool        useGpu;
+  // -----------------------------------------------------------------------
+  // Work file state
+  // -----------------------------------------------------------------------
+  std::string workFile;
+  std::string inputFile;
+  std::string outputFile;
+  uint32_t    saveWorkPeriod;       // seconds between automatic saves
+  bool        saveKangaroo;         // include kangaroo state in workfile
+  bool        saveKangarooByServer; // server-side kangaroo save
+  bool        splitWorkfile;        // write partitioned workfiles
+  uint64_t    nbLoadedWalk;         // kangaroos loaded from input workfile
+  FILE       *fRead;                // open handle during streaming load
 
-// Network
-bool        clientMode;
-bool        saveKangarooByServer_flag;
-std::string serverIp;
-int         port;
-int         wtimeout;
-int         ntimeout;
-int         connectedClient;
-void       *hostInfo;
-uint32_t    pid;
+  // -----------------------------------------------------------------------
+  // Search control
+  // -----------------------------------------------------------------------
+  bool     endOfSearch;    // set true when key is found or maxStep reached
+  bool     saveRequest;    // set true by SIGINT/SIGTERM handler
+  int32_t  initDPSize;     // initial DP bit size (may be auto-tuned)
+  int      dpSize;         // current DP bit size
+  int256_t dMask;          // bitmask derived from dpSize for fast DP test
+  double   maxStep;        // stop after this many group ops (0 = unlimited)
+  double   offsetTime;     // wall-clock seconds already spent (from workfile)
+  uint64_t offsetCount;    // group operations already completed (from workfile)
 
-// Symmetry (range subdivisions)
-Int         rangeWidthDiv2Neg;
+  // -----------------------------------------------------------------------
+  // GPU
+  // -----------------------------------------------------------------------
+  bool useGpu;
 
-// Mutexes
-```
+  // -----------------------------------------------------------------------
+  // Network
+  // -----------------------------------------------------------------------
+  bool        clientMode;
+  std::string serverIp;
+  int         port;
+  int         wtimeout;    // workfile send timeout (seconds)
+  int         ntimeout;    // network operation timeout (seconds)
+  int         connectedClient;
+  void       *hostInfo;    // platform DNS/socket resolve result
+  uint32_t    pid;         // process ID (used in client handshake)
 
+  // -----------------------------------------------------------------------
+  // Symmetry helpers
+  // -----------------------------------------------------------------------
+  Int rangeWidthDiv2Neg;   // -(rangeWidth/2) — used for negation in USE_SYMMETRY
+
+  // -----------------------------------------------------------------------
+  // Mutexes
+  // ghMutex:   protects hashTable and collision state
+  // saveMutex: protects workfile write operations
+  // -----------------------------------------------------------------------
 #ifdef WIN64
-HANDLE      ghMutex;
-HANDLE      saveMutex;
+  HANDLE ghMutex;
+  HANDLE saveMutex;
 #else
-pthread_mutex_t ghMutex;
-pthread_mutex_t saveMutex;
+  pthread_mutex_t ghMutex;
+  pthread_mutex_t saveMutex;
 #endif
 
-```
-// CPU group size (tunable)
-int         CPU_GRP_SIZE;
-```
+  // -----------------------------------------------------------------------
+  // CPU group size (kangaroos per CPU thread batch)
+  // Set at runtime; default derived from system thread count.
+  // -----------------------------------------------------------------------
+  int CPU_GRP_SIZE;
 
 };
 
-// ———————————————————————–
-// Thread entry point trampolines (defined in Kangaroo.cpp)
-// ———————————————————————–
-
+// ––––––––––––––––––––––––––––––––––––––
+// Thread entry-point trampolines
+// Defined in Kangaroo.cpp; bridge OS thread API to member functions.
+// ––––––––––––––––––––––––––––––––––––––
 #ifdef WIN64
-DWORD WINAPI _SolveKeyCPU(LPVOID lpParam);
-DWORD WINAPI _SolveKeyGPU(LPVOID lpParam);
+  DWORD WINAPI _SolveKeyCPU(LPVOID lpParam);
+  DWORD WINAPI _SolveKeyGPU(LPVOID lpParam);
 #else
-void *_SolveKeyCPU(void *lpParam);
-void *_SolveKeyGPU(void *lpParam);
+  void *_SolveKeyCPU(void *lpParam);
+  void *_SolveKeyGPU(void *lpParam);
 #endif
 
-#endif // KANGAOOTH
+#endif // KANGAROOH
